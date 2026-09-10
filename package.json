@@ -1,0 +1,14 @@
+{
+  "name": "embedded-ass-extractor",
+  "version": "4.0.0",
+  "description": "Extracts embedded Arabic ASS/SSA subtitles (pure JS, no ffmpeg) and serves them as SRT for Nuvio/Stremio.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "matroska-subtitles": "^3.3.2"
+  }
+}
