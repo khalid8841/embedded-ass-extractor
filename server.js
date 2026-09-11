@@ -33,11 +33,16 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR);
 // No artificial candidate-count cap: every stream returned by the upstream manifest is eligible.
 // This is intentionally uncapped so a good subtitle-bearing source at position 21+
 // is never missed just because earlier sources were video-only/unsupported.
-const MAX_CANDIDATES = Infinity;
+// We intentionally process ONLY the stream selected by Stremio/Nuvio.
+// The subtitle request carries filename/videoSize/videoHash in its `extra`
+// object; use that metadata to identify the exact AIOStreams result instead
+// of scanning every stream returned by AIOStreams. This prevents huge memory
+// spikes from probing many full-length sources.
+const MAX_CANDIDATES = 1;
 const EXTRACT_TIMEOUT_MS = 8 * 60 * 1000;
 const RESPONSE_WAIT_MS = 45000;
 const MAX_REDIRECTS = 5;
-const MAX_CONCURRENT_EXTRACTIONS = 2;
+const MAX_CONCURRENT_EXTRACTIONS = 1;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_REQUESTS = 20; // per IP per window, across debug + subtitles endpoints
 const CACHE_TTL_MS = 48 * 60 * 60 * 1000; // 48h — successful results
@@ -260,7 +265,7 @@ cleanupCacheOnce();
 app.get('/:config/manifest.json', (req, res) => {
   res.json({
     id: 'com.khalid.embeddedass',
-    version: '17.0.0',
+    version: '20.0.0',
     name: 'Embedded ASS Extractor',
     description: 'Extracts embedded text subtitle tracks from remote MKV/MP4 streams and serves a web-compatible SRT.',
     resources: ['subtitles'],
@@ -529,16 +534,29 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', async (req, res) => {
   const streamManifestUrl = config.streamManifestUrl;
   const { type, id } = req.params;
   const lang = config.lang || 'ara';
+
+  // Stremio's subtitle protocol does NOT pass the selected stream URL itself.
+  // It does pass the selected video's identifying metadata (filename,
+  // videoSize, videoHash) in `extra`. We use that to pick exactly one
+  // matching AIOStreams result. See the official protocol docs: subtitle
+  // requests expose videoHash/videoSize/filename, not the stream URL.
+  const requestedVideo = parseSubtitleExtra(req.params.extra);
+  const requestFp = crypto.createHash('sha1')
+    .update(JSON.stringify(requestedVideo))
+    .digest('hex')
+    .slice(0, 12);
   const cfgFp = configFingerprint(streamManifestUrl);
-  const cacheKey = crypto.createHash('md5').update(`${cfgFp}:${type}:${id}:${lang}`).digest('hex');
+  const cacheKey = crypto.createHash('md5').update(`${cfgFp}:${type}:${id}:${lang}:${requestFp}`).digest('hex');
 
   let streams = null;
   let upstreamReachable = true;
   try {
-    streams = await getCandidates(streamManifestUrl, type, id, cacheKey);
+    const allStreams = await getCandidates(streamManifestUrl, type, id, cacheKey);
+    const selected = selectRequestedStream(allStreams, requestedVideo, cacheKey);
+    streams = selected ? [selected] : [];
   } catch (err) {
     upstreamReachable = false;
-    log(cacheKey, `Could not fetch upstream candidates: ${err.message}`);
+    log(cacheKey, `Could not fetch/select upstream candidate: ${err.message}`);
   }
 
   const currentFingerprints = new Set((streams || []).filter(s => s.url).map(s => urlFingerprint(s.url)));
@@ -606,7 +624,7 @@ app.get('/subs/:file', (req, res) => {
   fs.createReadStream(filePath).pipe(res);
 });
 
-app.get('/', (req, res) => res.send('Embedded Subtitle Extractor v19 is running.'));
+app.get('/', (req, res) => res.send('Embedded Subtitle Extractor v20 is running.'));
 
 function waitForFile(filePath, timeoutMs) {
   return new Promise(resolve => {
@@ -623,6 +641,122 @@ function waitForFile(filePath, timeoutMs) {
 // ---------------------------------------------------------------------------
 // Upstream (Torrentio) stream list
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Identify the exact stream selected by Stremio/Nuvio
+// ---------------------------------------------------------------------------
+
+function parseSubtitleExtra(raw) {
+  const out = {};
+  if (!raw) return out;
+  let text = String(raw);
+  try { text = decodeURIComponent(text); } catch (_) {}
+  // Some clients encode the extra object as a query string; others may wrap
+  // it as JSON. Support both without ever treating arbitrary input as a URL.
+  try {
+    if (text.trim().startsWith('{')) {
+      const obj = JSON.parse(text);
+      for (const k of ['videoHash', 'videoSize', 'filename']) {
+        if (obj[k] != null) out[k] = String(obj[k]);
+      }
+      return out;
+    }
+  } catch (_) {}
+  const qs = text.startsWith('?') ? text.slice(1) : text;
+  try {
+    const params = new URLSearchParams(qs);
+    for (const k of ['videoHash', 'videoSize', 'filename']) {
+      const v = params.get(k);
+      if (v != null && v !== '') out[k] = v;
+    }
+  } catch (_) {}
+  return out;
+}
+
+function streamFilename(stream) {
+  return String(
+    stream?.filename ||
+    stream?.behaviorHints?.filename ||
+    stream?.name ||
+    stream?.title ||
+    ''
+  ).trim();
+}
+
+function streamVideoSize(stream) {
+  const v = stream?.videoSize ?? stream?.behaviorHints?.videoSize;
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function streamVideoHash(stream) {
+  return String(stream?.videoHash || stream?.behaviorHints?.videoHash || '').trim().toLowerCase();
+}
+
+function normalizeFilename(name) {
+  return String(name || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .split('/')
+    .pop()
+    .toLowerCase();
+}
+
+function selectRequestedStream(streams, requested, cacheKey) {
+  const usable = (streams || []).filter(s => s && s.url);
+  if (!usable.length) {
+    log(cacheKey, 'AIOStreams returned no usable stream URLs.');
+    return null;
+  }
+
+  const reqFilename = normalizeFilename(requested?.filename);
+  const reqSize = requested?.videoSize != null ? Number(requested.videoSize) : null;
+  const reqHash = String(requested?.videoHash || '').trim().toLowerCase();
+
+  // Strongest match: exact video hash when supplied.
+  if (reqHash) {
+    const byHash = usable.filter(s => streamVideoHash(s) === reqHash);
+    if (byHash.length) {
+      log(cacheKey, `Selected EXACT stream by videoHash (1 of ${usable.length}); no other AIO stream will be opened.`);
+      return byHash[0];
+    }
+  }
+
+  // Filename is normally the most useful selector for remote HTTP streams.
+  if (reqFilename) {
+    const byName = usable.filter(s => normalizeFilename(streamFilename(s)) === reqFilename);
+    if (byName.length) {
+      // If several sources have the same filename, use videoSize to break the tie.
+      if (Number.isFinite(reqSize)) {
+        const exactSize = byName.find(s => streamVideoSize(s) === reqSize);
+        if (exactSize) {
+          log(cacheKey, `Selected EXACT stream by filename + videoSize (1 of ${usable.length}); no other AIO stream will be opened.`);
+          return exactSize;
+        }
+      }
+      log(cacheKey, `Selected stream by exact filename (1 of ${usable.length}); no other AIO stream will be opened.`);
+      return byName[0];
+    }
+  }
+
+  // If only size is available, use it as a selector.
+  if (Number.isFinite(reqSize)) {
+    const bySize = usable.filter(s => streamVideoSize(s) === reqSize);
+    if (bySize.length) {
+      log(cacheKey, `Selected stream by exact videoSize (1 of ${usable.length}); no other AIO stream will be opened.`);
+      return bySize[0];
+    }
+  }
+
+  // IMPORTANT: never fall back to scanning all streams. If the client did not
+  // provide identifying metadata, choose the first ranked stream only. This
+  // keeps memory bounded and guarantees one episode URL is inspected per
+  // subtitle request.
+  const first = usable[0];
+  log(cacheKey, `No selected-stream metadata matched; using ONLY the first ranked AIO stream as a safe fallback (1 of ${usable.length}).`);
+  return first;
+}
 
 async function getCandidates(streamManifestUrl, type, id, cacheKey) {
   const url = buildStreamUrl(streamManifestUrl, type, id);
@@ -657,7 +791,7 @@ async function getCandidates(streamManifestUrl, type, id, cacheKey) {
   ).length;
   log(
     cacheKey,
-    `Upstream returned ${data.streams ? data.streams.length : 0} stream(s) (${confirmedCount} with confirmed Arabic subtitle metadata), trying all ${streams.length} after ranking (Arabic metadata + MKV/MP4 filename hints).`
+    `Upstream returned ${data.streams ? data.streams.length : 0} stream(s) (${confirmedCount} with confirmed Arabic subtitle metadata). Streams are ranked only; exactly ONE selected stream is opened for extraction.`
   );
   return streams;
 }
