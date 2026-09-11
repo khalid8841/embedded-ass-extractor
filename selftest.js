@@ -128,6 +128,99 @@ console.log('\n--- Manifest URL -> stream endpoint building ---');
   });
 }
 
+console.log('\n--- Container detection (MKV vs MP4) ---');
+{
+  const { looksLikeMatroska, looksLikeMp4, classifyContainer, guessContainerHint, rankStreamCandidates } = require('./lib.js');
+
+  const mkvBytes = Buffer.from('1a45dfa3' + '00'.repeat(60), 'hex');
+  const mp4Bytes = Buffer.concat([Buffer.alloc(4), Buffer.from('ftyp', 'ascii'), Buffer.from('isom', 'ascii'), Buffer.alloc(50)]);
+  const htmlBytes = Buffer.from('<!DOCTYPE html>'.padEnd(64, ' '), 'ascii');
+
+  test('looksLikeMatroska detects real EBML bytes', () => assert.strictEqual(looksLikeMatroska(mkvBytes), true));
+  test('looksLikeMp4 detects the ftyp box at the correct offset', () => assert.strictEqual(looksLikeMp4(mp4Bytes), true));
+  test('looksLikeMp4 does not false-positive on Matroska bytes', () => assert.strictEqual(looksLikeMp4(mkvBytes), false));
+
+  test('classifyContainer identifies mkv from bytes alone', () =>
+    assert.strictEqual(classifyContainer('application/octet-stream', mkvBytes), 'mkv'));
+  test('classifyContainer identifies mp4 from Content-Type even with generic bytes', () =>
+    assert.strictEqual(classifyContainer('video/mp4', Buffer.alloc(64)), 'mp4'));
+  test('classifyContainer identifies mp4 from ftyp bytes even with a wrong/missing Content-Type', () =>
+    assert.strictEqual(classifyContainer('application/octet-stream', mp4Bytes), 'mp4'));
+  test('classifyContainer returns unknown for HTML (this is the real case that caused the AIOStreams 404 confusion earlier)', () =>
+    assert.strictEqual(classifyContainer('text/html', htmlBytes), 'unknown'));
+
+  test('guessContainerHint reads .mkv from a filename', () =>
+    assert.strictEqual(guessContainerHint({ name: 'Episode.S01E01.mkv' }), 'mkv'));
+  test('guessContainerHint reads .mp4 from a title', () =>
+    assert.strictEqual(guessContainerHint({ title: 'Episode.S01E01.mp4 [FHD]' }), 'mp4'));
+  test('guessContainerHint reads behaviorHints.filename', () =>
+    assert.strictEqual(guessContainerHint({ behaviorHints: { filename: 'movie.mkv' } }), 'mkv'));
+  test('guessContainerHint returns unknown when nothing hints at a container', () =>
+    assert.strictEqual(guessContainerHint({ name: 'Some Release Name' }), 'unknown'));
+
+  test('rankStreamCandidates puts a confirmed-Arabic MKV-hinted stream first, MP4-hinted last', () => {
+    const streams = [
+      { name: 'plain.mp4' }, // mp4 hint, no subtitle metadata
+      { name: 'unknown release' }, // no hints at all
+      { name: 'best.mkv', subtitles: ['ara'] }, // mkv hint + confirmed Arabic — should win
+      { name: 'ok.mkv' } // mkv hint only
+    ];
+    const result = rankStreamCandidates(streams);
+    assert.strictEqual(result[0].name, 'best.mkv');
+    assert.strictEqual(result[result.length - 1].name, 'plain.mp4');
+    assert.strictEqual(result.length, 4); // nothing dropped, only reordered
+  });
+}
+
+console.log('\n--- Candidate loop: MP4 is skipped, search continues to the next candidate ---');
+{
+  // This mirrors the exact decision processRequest() makes per candidate,
+  // without needing real network calls — proves the fast-skip logic itself
+  // is correct given a sequence of (contentType, firstBytes) results, which
+  // is exactly what the real AIOStreams scenario looked like: candidate #1
+  // was MP4 (skipped), and search must continue to find the MKV one.
+  const { classifyContainer } = require('./lib.js');
+
+  function pickFirstMatroska(peekResults) {
+    for (let i = 0; i < peekResults.length; i++) {
+      const container = classifyContainer(peekResults[i].contentType, peekResults[i].firstBytes);
+      if (container === 'mkv') return i;
+      // mp4 and unknown both fall through to "try next candidate"
+    }
+    return -1;
+  }
+
+  const mkvBytes = Buffer.from('1a45dfa3' + '00'.repeat(60), 'hex');
+  const mp4Bytes = Buffer.concat([Buffer.alloc(4), Buffer.from('ftyp', 'ascii'), Buffer.alloc(56)]);
+
+  test('skips an MP4 candidate at index 0 and selects the MKV candidate at index 1 (real scenario from the AIOStreams test)', () => {
+    const peekResults = [
+      { contentType: 'video/mp4', firstBytes: mp4Bytes }, // "🚀 FHD" from the real test
+      { contentType: 'video/x-matroska', firstBytes: mkvBytes }
+    ];
+    assert.strictEqual(pickFirstMatroska(peekResults), 1);
+  });
+
+  test('skips multiple MP4/unknown candidates in a row before finding the MKV one', () => {
+    const htmlBytes = Buffer.from('<!DOCTYPE html>'.padEnd(64, ' '), 'ascii');
+    const peekResults = [
+      { contentType: 'video/mp4', firstBytes: mp4Bytes },
+      { contentType: 'text/html', firstBytes: htmlBytes },
+      { contentType: 'video/mp4', firstBytes: mp4Bytes },
+      { contentType: 'video/x-matroska', firstBytes: mkvBytes }
+    ];
+    assert.strictEqual(pickFirstMatroska(peekResults), 3);
+  });
+
+  test('returns -1 (stop, none found) when every candidate is MP4', () => {
+    const peekResults = [
+      { contentType: 'video/mp4', firstBytes: mp4Bytes },
+      { contentType: 'video/mp4', firstBytes: mp4Bytes }
+    ];
+    assert.strictEqual(pickFirstMatroska(peekResults), -1);
+  });
+}
+
 console.log(`\n${passed} test(s) passed.\n`);
 
 console.log('--- Notes on what is NOT covered by these offline tests ---');

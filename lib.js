@@ -108,6 +108,65 @@ function looksLikeMatroska(buffer) {
   return Buffer.isBuffer(buffer) && buffer.length >= 4 && buffer.slice(0, 4).toString('hex') === '1a45dfa3';
 }
 
+// Detects an MP4/ISO-BMFF container from its bytes: a valid MP4 starts with
+// a 4-byte box size, then the ASCII bytes "ftyp" at offset 4. Checking this
+// directly (not just trusting the Content-Type header) lets us fast-skip an
+// MP4 candidate even if a server mislabels its content type.
+function looksLikeMp4(buffer) {
+  return Buffer.isBuffer(buffer) && buffer.length >= 8 && buffer.slice(4, 8).toString('ascii') === 'ftyp';
+}
+
+// Combines Content-Type and the actual first bytes into one classification.
+// We only ever want to proceed to full extraction for 'mkv' — everything
+// else (mp4, unknown/other) is skipped immediately without wasting time on
+// a full matroska-subtitles parse attempt that can never find an ASS/SSA
+// track in a non-Matroska container.
+function classifyContainer(contentType, firstBytes) {
+  if (looksLikeMatroska(firstBytes)) return 'mkv';
+  if ((contentType && /mp4/i.test(contentType)) || looksLikeMp4(firstBytes)) return 'mp4';
+  return 'unknown';
+}
+
+// Best-effort guess of a stream's container from whatever text metadata is
+// available (filename, name, title) — used ONLY to influence try-order
+// before we've made any network request. This is a hint, never a final
+// decision: classifyContainer() (from real bytes) is always the actual
+// gate before extraction is attempted.
+function guessContainerHint(stream) {
+  const haystack = [stream.filename, stream.name, stream.title, stream.behaviorHints && stream.behaviorHints.filename]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  if (/\.mkv\b/.test(haystack)) return 'mkv';
+  if (/\.mp4\b/.test(haystack)) return 'mp4';
+  return 'unknown';
+}
+
+// Final candidate ordering used before any network calls: combines two
+// independent signals —
+//   (a) confirmed Arabic subtitle metadata (from prioritizeKnownArabicSubtitles)
+//   (b) a filename/title hint that the container is MKV vs MP4
+// into one score, highest first. Nothing is ever dropped — a stream with no
+// useful hints at all just stays in its original relative position among
+// other "unknown" entries (stable sort).
+function rankStreamCandidates(streams) {
+  const isArabicConfirmed = s =>
+    Array.isArray(s.subtitles) && s.subtitles.some(code => /^ar(a)?$/i.test(String(code).trim()));
+
+  const scored = streams.map((s, originalIndex) => {
+    const containerHint = guessContainerHint(s);
+    let score = 0;
+    if (isArabicConfirmed(s)) score += 2;
+    if (containerHint === 'mkv') score += 1;
+    if (containerHint === 'mp4') score -= 1;
+    return { s, score, originalIndex };
+  });
+
+  // Stable sort by score descending; ties keep original relative order.
+  scored.sort((a, b) => b.score - a.score || a.originalIndex - b.originalIndex);
+  return scored.map(x => x.s);
+}
+
 // AIOStreams (via StremThru-probed results) sometimes includes a real,
 // FFmpeg-probed `subtitles` array on each stream object listing the
 // language codes of subtitle tracks actually embedded in that file — not
@@ -153,6 +212,10 @@ module.exports = {
   cleanAssText,
   looksLikeJsonResponse,
   looksLikeMatroska,
+  looksLikeMp4,
+  classifyContainer,
+  guessContainerHint,
+  rankStreamCandidates,
   prioritizeKnownArabicSubtitles,
   hasManifestSuffix,
   buildStreamUrl

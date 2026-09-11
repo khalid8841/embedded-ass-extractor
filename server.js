@@ -1,5 +1,5 @@
 // Embedded ASS/SSA Subtitle Extractor — Stremio/Nuvio-compatible addon
-// v13 — requires streamManifestUrl to end with /manifest.json (fixes AIOStreams 404) (debug-aio), no video access + comprehensive security + correctness pass (see README for the full
+// v14 — MKV-first candidate ranking + fast MP4 skip; requires streamManifestUrl to end with /manifest.json (fixes AIOStreams 404) (debug-aio), no video access + comprehensive security + correctness pass (see README for the full
 // list). This is a single consolidated version, not an incremental patch.
 
 const express = require('express');
@@ -10,7 +10,7 @@ const path = require('path');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 const net = require('net');
-const { MANIFEST_HOST_ALLOWLIST, CACHE_KEY_RE, redact, isPrivateOrReservedIp, isManifestHostAllowed, cleanAssText, looksLikeJsonResponse, looksLikeMatroska, prioritizeKnownArabicSubtitles, hasManifestSuffix, buildStreamUrl } = require('./lib.js');
+const { MANIFEST_HOST_ALLOWLIST, CACHE_KEY_RE, redact, isPrivateOrReservedIp, isManifestHostAllowed, cleanAssText, looksLikeJsonResponse, looksLikeMatroska, classifyContainer, rankStreamCandidates, hasManifestSuffix, buildStreamUrl } = require('./lib.js');
 
 const app = express();
 app.set('trust proxy', 1); // Render sits behind one reverse-proxy hop — this
@@ -29,7 +29,7 @@ app.use((req, res, next) => {
 const CACHE_DIR = path.join(__dirname, 'cache');
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR);
 
-const MAX_CANDIDATES = 4;
+const MAX_CANDIDATES = 20; // raised from 4 — AIOStreams instances can return dozens of results, and the first few aren't guaranteed to be MKV
 const EXTRACT_TIMEOUT_MS = 8 * 60 * 1000;
 const RESPONSE_WAIT_MS = 45000;
 const MAX_REDIRECTS = 5;
@@ -256,7 +256,7 @@ cleanupCacheOnce();
 app.get('/:config/manifest.json', (req, res) => {
   res.json({
     id: 'com.khalid.embeddedass',
-    version: '13.0.0',
+    version: '14.0.0',
     name: 'Embedded ASS Extractor',
     description: 'Finds the embedded Arabic ASS/SSA subtitle track and serves it as SRT.',
     resources: ['subtitles'],
@@ -602,7 +602,7 @@ app.get('/subs/:file', (req, res) => {
   fs.createReadStream(filePath).pipe(res);
 });
 
-app.get('/', (req, res) => res.send('Embedded ASS Extractor v13 is running.'));
+app.get('/', (req, res) => res.send('Embedded ASS Extractor v14 is running.'));
 
 function waitForFile(filePath, timeoutMs) {
   return new Promise(resolve => {
@@ -645,14 +645,14 @@ async function getCandidates(streamManifestUrl, type, id, cacheKey) {
     throw new Error('Upstream response could not be parsed as JSON');
   }
 
-  const ordered = prioritizeKnownArabicSubtitles(data.streams || []);
+  const ordered = rankStreamCandidates(data.streams || []);
   const streams = ordered.slice(0, MAX_CANDIDATES);
   const confirmedCount = (data.streams || []).filter(
     s => Array.isArray(s.subtitles) && s.subtitles.some(c => /^ar(a)?$/i.test(String(c).trim()))
   ).length;
   log(
     cacheKey,
-    `Upstream returned ${data.streams ? data.streams.length : 0} stream(s) (${confirmedCount} with confirmed Arabic subtitle metadata), using top ${streams.length} after prioritization.`
+    `Upstream returned ${data.streams ? data.streams.length : 0} stream(s) (${confirmedCount} with confirmed Arabic subtitle metadata), using top ${streams.length} after ranking (Arabic metadata + MKV/MP4 filename hints).`
   );
   return streams;
 }
@@ -673,11 +673,20 @@ async function processRequest(streams, cacheKey) {
     log(cacheKey, `--- Checking candidate ${i + 1}/${streams.length}: ${label}`);
 
     try {
-      // Verify the source looks like Matroska before committing to a full
-      // parse — avoids feeding an HTML/JSON/unexpected-format response into
-      // the subtitle parser.
-      const { firstBytes } = await peekStream(videoUrl, cacheKey);
-      if (!looksLikeMatroska(firstBytes)) {
+      // Classify the real container from its actual bytes/content-type
+      // before committing to a full parse. We only ever proceed for 'mkv' —
+      // 'mp4' is fast-skipped immediately (MP4 can carry mov_text
+      // subtitles, but never the ASS/SSA tracks we're looking for), and
+      // anything unrecognized is skipped too rather than risking a bad
+      // parse attempt.
+      const { headers, firstBytes } = await peekStream(videoUrl, cacheKey);
+      const container = classifyContainer(headers.contentType, firstBytes);
+
+      if (container === 'mp4') {
+        log(cacheKey, `"${label}" is MP4 (confirmed via ${/mp4/i.test(headers.contentType || '') ? 'Content-Type' : 'ftyp bytes'}) — MP4 cannot carry ASS/SSA, skipping fast.`);
+        continue;
+      }
+      if (container !== 'mkv') {
         log(cacheKey, `"${label}" does not look like Matroska (no EBML header) — skipping.`);
         continue;
       }
@@ -829,5 +838,5 @@ function buildSrt(cues) {
 
 const PORT = process.env.PORT || 7005;
 app.listen(PORT, () => {
-  console.log('Embedded ASS Extractor v13 running on port', PORT);
+  console.log('Embedded ASS Extractor v14 running on port', PORT);
 });
