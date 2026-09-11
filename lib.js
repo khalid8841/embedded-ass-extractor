@@ -125,6 +125,25 @@ function prioritizeKnownArabicSubtitles(streams) {
   return [...confirmed, ...rest];
 }
 
+// The stream-manifest URL MUST end with exactly "/manifest.json" — that's
+// what getCandidates() strips off to build the stream endpoint. If it's
+// missing, stripping does nothing and the stream path gets concatenated
+// onto the raw URL with no separating slash (e.g. ".../secretstream/..."),
+// producing a broken path that upstream correctly 404s on. Validating this
+// up front turns that into a clear, immediate error instead of a confusing
+// 404 three steps later.
+function hasManifestSuffix(urlStr) {
+  return typeof urlStr === 'string' && /\/manifest\.json$/.test(urlStr);
+}
+
+// Given a valid manifest URL (see hasManifestSuffix), builds the Stremio
+// stream endpoint for a given type/id, preserving every path segment before
+// "manifest.json" (profile IDs, secrets, config tokens, etc.) untouched.
+function buildStreamUrl(streamManifestUrl, type, id) {
+  const base = streamManifestUrl.replace(/manifest\.json$/, '');
+  return `${base}stream/${type}/${id}.json`;
+}
+
 module.exports = {
   MANIFEST_HOST_ALLOWLIST,
   CACHE_KEY_RE,
@@ -134,5 +153,7 @@ module.exports = {
   cleanAssText,
   looksLikeJsonResponse,
   looksLikeMatroska,
-  prioritizeKnownArabicSubtitles
+  prioritizeKnownArabicSubtitles,
+  hasManifestSuffix,
+  buildStreamUrl
 };

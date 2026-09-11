@@ -1,5 +1,5 @@
 // Embedded ASS/SSA Subtitle Extractor — Stremio/Nuvio-compatible addon
-// v12 — adds a sanitized AIOStreams-only debug endpoint (debug-aio), no video access + comprehensive security + correctness pass (see README for the full
+// v13 — requires streamManifestUrl to end with /manifest.json (fixes AIOStreams 404) (debug-aio), no video access + comprehensive security + correctness pass (see README for the full
 // list). This is a single consolidated version, not an incremental patch.
 
 const express = require('express');
@@ -10,7 +10,7 @@ const path = require('path');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 const net = require('net');
-const { MANIFEST_HOST_ALLOWLIST, CACHE_KEY_RE, redact, isPrivateOrReservedIp, isManifestHostAllowed, cleanAssText, looksLikeJsonResponse, looksLikeMatroska, prioritizeKnownArabicSubtitles } = require('./lib.js');
+const { MANIFEST_HOST_ALLOWLIST, CACHE_KEY_RE, redact, isPrivateOrReservedIp, isManifestHostAllowed, cleanAssText, looksLikeJsonResponse, looksLikeMatroska, prioritizeKnownArabicSubtitles, hasManifestSuffix, buildStreamUrl } = require('./lib.js');
 
 const app = express();
 app.set('trust proxy', 1); // Render sits behind one reverse-proxy hop — this
@@ -256,7 +256,7 @@ cleanupCacheOnce();
 app.get('/:config/manifest.json', (req, res) => {
   res.json({
     id: 'com.khalid.embeddedass',
-    version: '12.0.0',
+    version: '13.0.0',
     name: 'Embedded ASS Extractor',
     description: 'Finds the embedded Arabic ASS/SSA subtitle track and serves it as SRT.',
     resources: ['subtitles'],
@@ -281,10 +281,14 @@ app.get('/:config/debug/:type/:id', async (req, res) => {
   if (!isManifestHostAllowed(config.streamManifestUrl)) {
     return res.status(403).json({ error: 'streamManifestUrl host is not on the allowlist' });
   }
+  if (!hasManifestSuffix(config.streamManifestUrl)) {
+    return res.status(400).json({
+      error: 'streamManifestUrl must end with "/manifest.json" exactly (e.g. .../profile/secret/manifest.json) — this is required to correctly build the stream endpoint URL.'
+    });
+  }
 
   const { type, id } = req.params;
-  const base = config.streamManifestUrl.replace(/manifest\.json.*$/, '');
-  const url = `${base}stream/${type}/${id}.json`;
+  const url = buildStreamUrl(config.streamManifestUrl, type, id);
 
   try {
     const upstreamRes = await safeFetch(url, { headers: UPSTREAM_HEADERS }, 'debug');
@@ -330,10 +334,14 @@ app.get('/:config/debug-aio/:type/:id', async (req, res) => {
   if (!isManifestHostAllowed(config.streamManifestUrl)) {
     return res.status(403).json({ error: 'streamManifestUrl host is not on the allowlist' });
   }
+  if (!hasManifestSuffix(config.streamManifestUrl)) {
+    return res.status(400).json({
+      error: 'streamManifestUrl must end with "/manifest.json" exactly (e.g. .../profile/secret/manifest.json) — this is required to correctly build the stream endpoint URL.'
+    });
+  }
 
   const { type, id } = req.params;
-  const base = config.streamManifestUrl.replace(/manifest\.json.*$/, '');
-  const url = `${base}stream/${type}/${id}.json`;
+  const url = buildStreamUrl(config.streamManifestUrl, type, id);
 
   try {
     const upstreamRes = await safeFetch(url, { headers: UPSTREAM_HEADERS }, 'debug-aio');
@@ -416,6 +424,11 @@ app.get('/:config/debug-stream/:type/:id', async (req, res) => {
   }
   if (!isManifestHostAllowed(config.streamManifestUrl)) {
     return res.status(403).json({ error: 'streamManifestUrl host is not on the allowlist' });
+  }
+  if (!hasManifestSuffix(config.streamManifestUrl)) {
+    return res.status(400).json({
+      error: 'streamManifestUrl must end with "/manifest.json" exactly (e.g. .../profile/secret/manifest.json) — this is required to correctly build the stream endpoint URL.'
+    });
   }
 
   const { type, id } = req.params;
@@ -504,6 +517,10 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', async (req, res) => {
     log('subtitles', `Rejected config: host not on allowlist (${redact(config.streamManifestUrl)})`);
     return res.json({ subtitles: [] });
   }
+  if (!hasManifestSuffix(config.streamManifestUrl)) {
+    log('subtitles', `Rejected config: streamManifestUrl does not end with /manifest.json (${redact(config.streamManifestUrl)})`);
+    return res.json({ subtitles: [] });
+  }
 
   const streamManifestUrl = config.streamManifestUrl;
   const { type, id } = req.params;
@@ -585,7 +602,7 @@ app.get('/subs/:file', (req, res) => {
   fs.createReadStream(filePath).pipe(res);
 });
 
-app.get('/', (req, res) => res.send('Embedded ASS Extractor v12 is running.'));
+app.get('/', (req, res) => res.send('Embedded ASS Extractor v13 is running.'));
 
 function waitForFile(filePath, timeoutMs) {
   return new Promise(resolve => {
@@ -604,8 +621,7 @@ function waitForFile(filePath, timeoutMs) {
 // ---------------------------------------------------------------------------
 
 async function getCandidates(streamManifestUrl, type, id, cacheKey) {
-  const base = streamManifestUrl.replace(/manifest\.json.*$/, '');
-  const url = `${base}stream/${type}/${id}.json`;
+  const url = buildStreamUrl(streamManifestUrl, type, id);
 
   log(cacheKey, `Fetching upstream: ${redact(url)}`);
   const streamRes = await safeFetch(url, { headers: UPSTREAM_HEADERS }, cacheKey);
@@ -813,5 +829,5 @@ function buildSrt(cues) {
 
 const PORT = process.env.PORT || 7005;
 app.listen(PORT, () => {
-  console.log('Embedded ASS Extractor v12 running on port', PORT);
+  console.log('Embedded ASS Extractor v13 running on port', PORT);
 });

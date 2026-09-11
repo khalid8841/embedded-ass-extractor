@@ -105,6 +105,29 @@ console.log('\n--- AIOStreams confirmed-subtitle prioritization ---');
   });
 }
 
+console.log('\n--- Manifest URL -> stream endpoint building ---');
+{
+  const { hasManifestSuffix, buildStreamUrl } = require('./lib.js');
+
+  test('accepts a URL ending in /manifest.json', () =>
+    assert.strictEqual(hasManifestSuffix('https://host/stremio/profile/secret/manifest.json'), true));
+  test('rejects a URL missing /manifest.json (the actual bug that caused the AIOStreams 404)', () =>
+    assert.strictEqual(hasManifestSuffix('https://host/stremio/profile/secret'), false));
+  test('rejects a URL with manifest.json not at the very end', () =>
+    assert.strictEqual(hasManifestSuffix('https://host/manifest.json?foo=bar'), false));
+
+  test('preserves every path segment (profile + secret) when building the stream URL', () => {
+    const input = 'https://host/stremio/profile/secret/manifest.json';
+    const result = buildStreamUrl(input, 'series', 'tt9679542:4:15');
+    assert.strictEqual(result, 'https://host/stremio/profile/secret/stream/series/tt9679542:4:15.json');
+  });
+  test('works the same way for a simple Torrentio-style URL (no regression)', () => {
+    const input = 'https://torrentio.strem.fun/realdebrid=FAKEKEY/manifest.json';
+    const result = buildStreamUrl(input, 'movie', 'tt1234567');
+    assert.strictEqual(result, 'https://torrentio.strem.fun/realdebrid=FAKEKEY/stream/movie/tt1234567.json');
+  });
+}
+
 console.log(`\n${passed} test(s) passed.\n`);
 
 console.log('--- Notes on what is NOT covered by these offline tests ---');
