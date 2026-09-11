@@ -70,6 +70,40 @@ console.log('\n--- Manifest host allowlist ---');
 test('allows torrentio.strem.fun', () => assert.strictEqual(isManifestHostAllowed('https://torrentio.strem.fun/realdebrid=KEY/manifest.json'), true));
 test('rejects an arbitrary/attacker-supplied host', () => assert.strictEqual(isManifestHostAllowed('https://evil.example.com/manifest.json'), false));
 test('rejects a malformed URL', () => assert.strictEqual(isManifestHostAllowed('not-a-url'), false));
+test('also allows a configured AIOStreams instance hostname', () =>
+  assert.strictEqual(isManifestHostAllowed('https://aiostreamsfortheweebs.midnightignite.me/some/config/manifest.json'), true));
+
+console.log('\n--- AIOStreams confirmed-subtitle prioritization ---');
+{
+  const { prioritizeKnownArabicSubtitles } = require('./lib.js');
+  test('moves a stream with confirmed Arabic subtitle metadata to the front', () => {
+    const streams = [
+      { name: 'no metadata #1' },
+      { name: 'has German', subtitles: ['ger'] },
+      { name: 'has Arabic', subtitles: ['ara', 'eng'] },
+      { name: 'no metadata #2' }
+    ];
+    const result = prioritizeKnownArabicSubtitles(streams);
+    assert.strictEqual(result[0].name, 'has Arabic');
+    assert.strictEqual(result.length, 4); // nothing dropped
+  });
+  test('preserves relative order among streams without confirmed metadata', () => {
+    const streams = [{ name: 'a' }, { name: 'b' }, { name: 'c', subtitles: ['ara'] }, { name: 'd' }];
+    const result = prioritizeKnownArabicSubtitles(streams);
+    assert.deepStrictEqual(
+      result.map(s => s.name),
+      ['c', 'a', 'b', 'd']
+    );
+  });
+  test('handles no confirmed-Arabic streams at all (order unchanged)', () => {
+    const streams = [{ name: 'a' }, { name: 'b', subtitles: ['eng'] }];
+    const result = prioritizeKnownArabicSubtitles(streams);
+    assert.deepStrictEqual(
+      result.map(s => s.name),
+      ['a', 'b']
+    );
+  });
+}
 
 console.log(`\n${passed} test(s) passed.\n`);
 

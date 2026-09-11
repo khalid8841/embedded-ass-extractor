@@ -1,5 +1,5 @@
 // Embedded ASS/SSA Subtitle Extractor — Stremio/Nuvio-compatible addon
-// v10 — comprehensive security + correctness pass (see README for the full
+// v12 — adds a sanitized AIOStreams-only debug endpoint (debug-aio), no video access + comprehensive security + correctness pass (see README for the full
 // list). This is a single consolidated version, not an incremental patch.
 
 const express = require('express');
@@ -10,7 +10,7 @@ const path = require('path');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 const net = require('net');
-const { MANIFEST_HOST_ALLOWLIST, CACHE_KEY_RE, redact, isPrivateOrReservedIp, isManifestHostAllowed, cleanAssText, looksLikeJsonResponse, looksLikeMatroska } = require('./lib.js');
+const { MANIFEST_HOST_ALLOWLIST, CACHE_KEY_RE, redact, isPrivateOrReservedIp, isManifestHostAllowed, cleanAssText, looksLikeJsonResponse, looksLikeMatroska, prioritizeKnownArabicSubtitles } = require('./lib.js');
 
 const app = express();
 app.set('trust proxy', 1); // Render sits behind one reverse-proxy hop — this
@@ -256,7 +256,7 @@ cleanupCacheOnce();
 app.get('/:config/manifest.json', (req, res) => {
   res.json({
     id: 'com.khalid.embeddedass',
-    version: '10.0.0',
+    version: '12.0.0',
     name: 'Embedded ASS Extractor',
     description: 'Finds the embedded Arabic ASS/SSA subtitle track and serves it as SRT.',
     resources: ['subtitles'],
@@ -279,7 +279,7 @@ app.get('/:config/debug/:type/:id', async (req, res) => {
     return res.status(400).json({ error: 'Invalid or missing config' });
   }
   if (!isManifestHostAllowed(config.streamManifestUrl)) {
-    return res.status(403).json({ error: 'streamManifestUrl host is not on the allowlist (Torrentio only)' });
+    return res.status(403).json({ error: 'streamManifestUrl host is not on the allowlist' });
   }
 
   const { type, id } = req.params;
@@ -313,6 +313,97 @@ app.get('/:config/debug/:type/:id', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Debug: list what an upstream (e.g. AIOStreams) actually returns, WITHOUT
+// touching any video URL at all — no download, no MKV probing, no
+// extraction. Just: did we get a valid stream list, and does each entry
+// look usable (has a URL, has subtitle metadata or not)? This answers
+// "does Render -> AIOStreams -> stream list work" in isolation, before
+// trusting anything downstream of it.
+// ---------------------------------------------------------------------------
+app.get('/:config/debug-aio/:type/:id', async (req, res) => {
+  if (!checkRateLimit(req, res)) return;
+
+  const config = decodeConfig(req.params.config);
+  if (!config || !config.streamManifestUrl) {
+    return res.status(400).json({ error: 'Invalid or missing config' });
+  }
+  if (!isManifestHostAllowed(config.streamManifestUrl)) {
+    return res.status(403).json({ error: 'streamManifestUrl host is not on the allowlist' });
+  }
+
+  const { type, id } = req.params;
+  const base = config.streamManifestUrl.replace(/manifest\.json.*$/, '');
+  const url = `${base}stream/${type}/${id}.json`;
+
+  try {
+    const upstreamRes = await safeFetch(url, { headers: UPSTREAM_HEADERS }, 'debug-aio');
+    const contentType = upstreamRes.headers.get('content-type') || '';
+    const bodyText = await upstreamRes.text();
+    const looksLikeJson = looksLikeJsonResponse(contentType, bodyText);
+
+    if (!looksLikeJson) {
+      return res.json({
+        requestedUrl: redact(url),
+        httpStatus: upstreamRes.status,
+        contentType,
+        looksLikeJson: false,
+        bodySnippet: redact(bodyText.slice(0, 300))
+      });
+    }
+
+    let data;
+    try {
+      data = JSON.parse(bodyText);
+    } catch (e) {
+      return res.json({
+        requestedUrl: redact(url),
+        httpStatus: upstreamRes.status,
+        contentType,
+        looksLikeJson: true,
+        jsonParseError: true,
+        bodySnippet: redact(bodyText.slice(0, 300))
+      });
+    }
+
+    const rawStreams = data.streams || [];
+    // Sanitized summary only — never echo the actual url (it may embed
+    // debrid credentials in the path), and never fetch it.
+    const streamsSummary = rawStreams.map((s, i) => ({
+      index: i,
+      name: s.name || null,
+      title: s.title || null,
+      hasUrl: Boolean(s.url),
+      urlHostRedactedPath: s.url ? safeUrlHostOnly(s.url) : null,
+      hasSubtitlesMetadata: Array.isArray(s.subtitles),
+      subtitleLanguages: Array.isArray(s.subtitles) ? s.subtitles.map(String) : null,
+      confirmedArabic: Array.isArray(s.subtitles) && s.subtitles.some(c => /^ar(a)?$/i.test(String(c).trim()))
+    }));
+
+    res.json({
+      requestedUrl: redact(url),
+      httpStatus: upstreamRes.status,
+      contentType,
+      looksLikeJson: true,
+      streamCount: rawStreams.length,
+      streams: streamsSummary
+    });
+  } catch (err) {
+    res.status(500).json({ requestedUrl: redact(url), error: redact(err.message) });
+  }
+});
+
+// Returns only the hostname of a URL (e.g. "real-debrid.com") — used so the
+// debug-aio endpoint can show WHERE a stream URL points without ever
+// exposing the full URL (which may contain an API key/token in its path).
+function safeUrlHostOnly(urlStr) {
+  try {
+    return new URL(urlStr).hostname;
+  } catch (e) {
+    return '(unparseable)';
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Debug Test 2: Render -> stream URL -> first bytes, verified as Matroska
 // ---------------------------------------------------------------------------
 
@@ -324,7 +415,7 @@ app.get('/:config/debug-stream/:type/:id', async (req, res) => {
     return res.status(400).json({ error: 'Invalid or missing config' });
   }
   if (!isManifestHostAllowed(config.streamManifestUrl)) {
-    return res.status(403).json({ error: 'streamManifestUrl host is not on the allowlist (Torrentio only)' });
+    return res.status(403).json({ error: 'streamManifestUrl host is not on the allowlist' });
   }
 
   const { type, id } = req.params;
@@ -494,7 +585,7 @@ app.get('/subs/:file', (req, res) => {
   fs.createReadStream(filePath).pipe(res);
 });
 
-app.get('/', (req, res) => res.send('Embedded ASS Extractor v10 is running.'));
+app.get('/', (req, res) => res.send('Embedded ASS Extractor v12 is running.'));
 
 function waitForFile(filePath, timeoutMs) {
   return new Promise(resolve => {
@@ -538,8 +629,15 @@ async function getCandidates(streamManifestUrl, type, id, cacheKey) {
     throw new Error('Upstream response could not be parsed as JSON');
   }
 
-  const streams = (data.streams || []).slice(0, MAX_CANDIDATES);
-  log(cacheKey, `Upstream returned ${data.streams ? data.streams.length : 0} stream(s), using top ${streams.length}.`);
+  const ordered = prioritizeKnownArabicSubtitles(data.streams || []);
+  const streams = ordered.slice(0, MAX_CANDIDATES);
+  const confirmedCount = (data.streams || []).filter(
+    s => Array.isArray(s.subtitles) && s.subtitles.some(c => /^ar(a)?$/i.test(String(c).trim()))
+  ).length;
+  log(
+    cacheKey,
+    `Upstream returned ${data.streams ? data.streams.length : 0} stream(s) (${confirmedCount} with confirmed Arabic subtitle metadata), using top ${streams.length} after prioritization.`
+  );
   return streams;
 }
 
@@ -715,5 +813,5 @@ function buildSrt(cues) {
 
 const PORT = process.env.PORT || 7005;
 app.listen(PORT, () => {
-  console.log('Embedded ASS Extractor v10 running on port', PORT);
+  console.log('Embedded ASS Extractor v12 running on port', PORT);
 });

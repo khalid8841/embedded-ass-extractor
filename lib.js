@@ -5,7 +5,13 @@
 
 const net = require('net');
 
-const MANIFEST_HOST_ALLOWLIST = ['torrentio.strem.fun'];
+// Torrentio kept as a fallback option; AIOStreams instances (self-hosted or
+// third-party) are now also trusted, since a self-hosted AIOStreams
+// instance is the one talking to Torrentio server-side (not Render
+// directly), which sidesteps a 403 that specifically targets Render's
+// outbound IP hitting torrentio.strem.fun. Add your own AIOStreams
+// instance's hostname here.
+const MANIFEST_HOST_ALLOWLIST = ['torrentio.strem.fun', 'aiostreamsfortheweebs.midnightignite.me'];
 const CACHE_KEY_RE = /^[a-f0-9]{32}$/;
 
 function redact(text) {
@@ -102,6 +108,23 @@ function looksLikeMatroska(buffer) {
   return Buffer.isBuffer(buffer) && buffer.length >= 4 && buffer.slice(0, 4).toString('hex') === '1a45dfa3';
 }
 
+// AIOStreams (via StremThru-probed results) sometimes includes a real,
+// FFmpeg-probed `subtitles` array on each stream object listing the
+// language codes of subtitle tracks actually embedded in that file — not
+// just guessed from the filename. When present, we use it to try
+// already-confirmed-Arabic sources FIRST, before falling back to the
+// upstream's own default order. This is purely an ordering optimization:
+// streams without this metadata (e.g. plain Torrentio results) are left in
+// their original relative order at the end, so nothing is ever skipped.
+function prioritizeKnownArabicSubtitles(streams) {
+  const hasConfirmedArabic = s =>
+    Array.isArray(s.subtitles) && s.subtitles.some(code => /^ar(a)?$/i.test(String(code).trim()));
+
+  const confirmed = streams.filter(hasConfirmedArabic);
+  const rest = streams.filter(s => !hasConfirmedArabic(s));
+  return [...confirmed, ...rest];
+}
+
 module.exports = {
   MANIFEST_HOST_ALLOWLIST,
   CACHE_KEY_RE,
@@ -110,5 +133,6 @@ module.exports = {
   isManifestHostAllowed,
   cleanAssText,
   looksLikeJsonResponse,
-  looksLikeMatroska
+  looksLikeMatroska,
+  prioritizeKnownArabicSubtitles
 };
