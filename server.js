@@ -1,5 +1,5 @@
 // Embedded ASS/SSA Subtitle Extractor — Stremio/Nuvio-compatible addon
-// v18 — universal embedded-text extraction: MKV Range/stream parser + MP4 moov/sample-table Range extractor; requires streamManifestUrl to end with /manifest.json (fixes AIOStreams 404) (debug-aio), no video access + comprehensive security + correctness pass (see README for the full
+// v19 — universal embedded-text extraction: MKV Range/stream parser + MP4 moov/sample-table Range extractor; requires streamManifestUrl to end with /manifest.json (fixes AIOStreams 404) (debug-aio), no video access + comprehensive security + correctness pass (see README for the full
 // list). This is a single consolidated version, not an incremental patch.
 
 const express = require('express');
@@ -30,7 +30,10 @@ app.use((req, res, next) => {
 const CACHE_DIR = path.join(__dirname, 'cache');
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR);
 
-const MAX_CANDIDATES = 20; // raised from 4 — AIOStreams instances can return dozens of results, and the first few aren't guaranteed to be MKV
+// No artificial candidate-count cap: every stream returned by the upstream manifest is eligible.
+// This is intentionally uncapped so a good subtitle-bearing source at position 21+
+// is never missed just because earlier sources were video-only/unsupported.
+const MAX_CANDIDATES = Infinity;
 const EXTRACT_TIMEOUT_MS = 8 * 60 * 1000;
 const RESPONSE_WAIT_MS = 45000;
 const MAX_REDIRECTS = 5;
@@ -603,7 +606,7 @@ app.get('/subs/:file', (req, res) => {
   fs.createReadStream(filePath).pipe(res);
 });
 
-app.get('/', (req, res) => res.send('Embedded Subtitle Extractor v18 is running.'));
+app.get('/', (req, res) => res.send('Embedded Subtitle Extractor v19 is running.'));
 
 function waitForFile(filePath, timeoutMs) {
   return new Promise(resolve => {
@@ -647,13 +650,14 @@ async function getCandidates(streamManifestUrl, type, id, cacheKey) {
   }
 
   const ordered = rankStreamCandidates(data.streams || []);
-  const streams = ordered.slice(0, MAX_CANDIDATES);
+  // Do not slice/truncate: process every upstream stream.
+  const streams = ordered;
   const confirmedCount = (data.streams || []).filter(
     s => Array.isArray(s.subtitles) && s.subtitles.some(c => /^ar(a)?$/i.test(String(c).trim()))
   ).length;
   log(
     cacheKey,
-    `Upstream returned ${data.streams ? data.streams.length : 0} stream(s) (${confirmedCount} with confirmed Arabic subtitle metadata), using top ${streams.length} after ranking (Arabic metadata + MKV/MP4 filename hints).`
+    `Upstream returned ${data.streams ? data.streams.length : 0} stream(s) (${confirmedCount} with confirmed Arabic subtitle metadata), trying all ${streams.length} after ranking (Arabic metadata + MKV/MP4 filename hints).`
   );
   return streams;
 }
@@ -863,5 +867,5 @@ function buildSrt(cues) {
 
 const PORT = process.env.PORT || 7005;
 app.listen(PORT, () => {
-  console.log('Embedded Subtitle Extractor v18 running on port', PORT);
+  console.log('Embedded Subtitle Extractor v19 running on port', PORT);
 });
