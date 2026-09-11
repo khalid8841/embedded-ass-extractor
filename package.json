@@ -1,6 +1,6 @@
 {
   "name": "embedded-ass-extractor",
-  "version": "17.0.0",
+  "version": "18.0.0",
   "description": "Extracts embedded text subtitle tracks from remote MKV/MP4 streams using HTTP Range and serves a web-compatible SRT for Nuvio/Stremio.",
   "main": "server.js",
   "scripts": {

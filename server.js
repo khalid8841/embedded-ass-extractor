@@ -1,5 +1,5 @@
 // Embedded ASS/SSA Subtitle Extractor — Stremio/Nuvio-compatible addon
-// v17 — universal embedded-text extraction: MKV Range/stream parser + MP4 moov/sample-table Range extractor; requires streamManifestUrl to end with /manifest.json (fixes AIOStreams 404) (debug-aio), no video access + comprehensive security + correctness pass (see README for the full
+// v18 — universal embedded-text extraction: MKV Range/stream parser + MP4 moov/sample-table Range extractor; requires streamManifestUrl to end with /manifest.json (fixes AIOStreams 404) (debug-aio), no video access + comprehensive security + correctness pass (see README for the full
 // list). This is a single consolidated version, not an incremental patch.
 
 const express = require('express');
@@ -603,7 +603,7 @@ app.get('/subs/:file', (req, res) => {
   fs.createReadStream(filePath).pipe(res);
 });
 
-app.get('/', (req, res) => res.send('Embedded Subtitle Extractor v17 is running.'));
+app.get('/', (req, res) => res.send('Embedded Subtitle Extractor v18 is running.'));
 
 function waitForFile(filePath, timeoutMs) {
   return new Promise(resolve => {
@@ -863,5 +863,5 @@ function buildSrt(cues) {
 
 const PORT = process.env.PORT || 7005;
 app.listen(PORT, () => {
-  console.log('Embedded Subtitle Extractor v17 running on port', PORT);
+  console.log('Embedded Subtitle Extractor v18 running on port', PORT);
 });
