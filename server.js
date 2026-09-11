@@ -265,7 +265,7 @@ cleanupCacheOnce();
 app.get('/:config/manifest.json', (req, res) => {
   res.json({
     id: 'com.khalid.embeddedass',
-    version: '20.0.0',
+    version: '21.0.0',
     name: 'Embedded ASS Extractor',
     description: 'Extracts embedded text subtitle tracks from remote MKV/MP4 streams and serves a web-compatible SRT.',
     resources: ['subtitles'],
@@ -912,6 +912,59 @@ function chooseTrack(tracks, requestedLang) {
     usable[0];
 }
 
+// Reads the container from a stream's filename/title metadata. AIOStreams
+// exposes the real release filename, which is far more reliable for
+// container identity than probing a CDN/debrid URL's first bytes.
+function guessContainerFromFilename(stream) {
+  const haystack = [
+    stream.filename,
+    stream.behaviorHints && stream.behaviorHints.filename,
+    stream.name,
+    stream.title,
+    stream.description
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  if (/\.mkv(\b|$)/.test(haystack) || /matroska/.test(haystack)) return 'mkv';
+  if (/\.(mp4|m4v|mov)(\b|$)/.test(haystack)) return 'mp4';
+  return 'unknown';
+}
+
+// Decides which extractors to try and in what order. We ALWAYS try both
+// unless we have strong agreement — a failed or misleading probe must never
+// prevent an attempt, which was the core v20 bug.
+function decideExtractorOrder(filenameHint, probeContainer) {
+  if (filenameHint === 'mkv') return probeContainer === 'mp4' ? ['mkv', 'mp4'] : ['mkv', 'mp4'];
+  if (filenameHint === 'mp4') return ['mp4', 'mkv'];
+  if (probeContainer === 'mkv') return ['mkv', 'mp4'];
+  if (probeContainer === 'mp4') return ['mp4', 'mkv'];
+  return ['mkv', 'mp4']; // no evidence either way — try both, MKV first
+}
+
+// Detailed, secret-free diagnostics for one candidate's probe.
+function logPeekDiagnostics(cacheKey, label, stream, videoUrl, peekInfo) {
+  let host = '(unparseable)';
+  try {
+    host = new URL(videoUrl).hostname;
+  } catch (_) {}
+
+  const h = peekInfo.headers || {};
+  log(
+    cacheKey,
+    [
+      `PROBE "${label}":`,
+      `filename=${stream.filename || (stream.behaviorHints && stream.behaviorHints.filename) || '(none)'}`,
+      `urlHost=${host}`,
+      `status=${h.status}`,
+      `rangeHonored=${h.status === 206}`,
+      `contentType=${h.contentType || '(none)'}`,
+      `contentLength=${h.contentLength || '(none)'}`,
+      `acceptRanges=${h.acceptRanges || '(none)'}`,
+      `first16Bytes=${peekInfo.firstBytes ? peekInfo.firstBytes.slice(0, 16).toString('hex') : '(none)'}`,
+      `containerDetected=${peekInfo.container}`
+    ].join(' ')
+  );
+}
+
 async function processRequest(streams, cacheKey) {
   let probedAtLeastOne = false;
 
@@ -923,18 +976,56 @@ async function processRequest(streams, cacheKey) {
 
     log(cacheKey, `--- Checking candidate ${i + 1}/${streams.length}: ${label}`);
     try {
-      const { headers, firstBytes } = await peekStream(videoUrl, cacheKey);
-      const container = classifyContainer(headers.contentType, firstBytes);
-      let tracks = [];
+      // Container sniffing is a HINT for ordering, never a gatekeeper.
+      //
+      // Why: these URLs are Torrentio/Real-Debrid resolve links behind
+      // CDNs and redirects. A first-64-byte probe frequently does NOT
+      // return the container's opening bytes (redirect bodies, proxies
+      // that ignore Range, servers that return 200 with a different
+      // offset, untrustworthy Content-Type). v20 treated a failed sniff
+      // as "unsupported container" and skipped the candidate outright —
+      // which is exactly what killed a stream whose filename clearly
+      // said .mkv. Now we try the real extractors regardless, in the
+      // order the available evidence suggests.
+      const filenameHint = guessContainerFromFilename(s);
+      let peekInfo = null;
+      try {
+        const { headers, firstBytes } = await peekStream(videoUrl, cacheKey);
+        peekInfo = { headers, firstBytes, container: classifyContainer(headers.contentType, firstBytes) };
+        logPeekDiagnostics(cacheKey, label, s, videoUrl, peekInfo);
+      } catch (probeErr) {
+        log(cacheKey, `Probe of "${label}" failed (${probeErr.message}) — continuing anyway, probe is not a gate.`);
+      }
 
-      if (container === 'mp4') {
-        log(cacheKey, `"${label}" is MP4 — reading embedded text subtitle tracks with HTTP Range.`);
-        tracks = await extractMp4Tracks(safeFetch, videoUrl, cacheKey);
-      } else if (container === 'mkv') {
-        log(cacheKey, `"${label}" is Matroska — reading embedded subtitle tracks with MKV Range extractor.`);
-        tracks = await extractMkvTracks(videoUrl, safeFetch, cacheKey);
-      } else {
-        log(cacheKey, `"${label}" is not a supported text-subtitle container — skipping.`);
+      const order = decideExtractorOrder(filenameHint, peekInfo && peekInfo.container);
+      log(cacheKey, `"${label}" extractor order: ${order.join(' -> ')} (filename hint: ${filenameHint}, probe says: ${peekInfo ? peekInfo.container : 'probe failed'})`);
+
+      let tracks = [];
+      const attemptErrors = [];
+      for (const kind of order) {
+        try {
+          if (kind === 'mkv') {
+            log(cacheKey, `Trying MKV Range extractor on "${label}"...`);
+            tracks = await extractMkvTracks(videoUrl, safeFetch, cacheKey);
+          } else {
+            log(cacheKey, `Trying MP4 Range extractor on "${label}"...`);
+            tracks = await extractMp4Tracks(safeFetch, videoUrl, cacheKey);
+          }
+          if (tracks && tracks.length) {
+            log(cacheKey, `${kind.toUpperCase()} extractor returned ${tracks.length} track(s) for "${label}".`);
+            break;
+          }
+          log(cacheKey, `${kind.toUpperCase()} extractor returned no tracks for "${label}".`);
+        } catch (extractErr) {
+          // Log the REAL error from the extractor rather than hiding it
+          // behind a generic "unsupported container" message.
+          attemptErrors.push(`${kind}: ${extractErr.message}`);
+          log(cacheKey, `${kind.toUpperCase()} extractor failed on "${label}": ${extractErr.message}`);
+        }
+      }
+
+      if ((!tracks || !tracks.length) && attemptErrors.length === order.length) {
+        log(cacheKey, `All extractors failed on "${label}" (${attemptErrors.join(' | ')}). Trying next source...`);
         continue;
       }
 
@@ -1001,5 +1092,5 @@ function buildSrt(cues) {
 
 const PORT = process.env.PORT || 7005;
 app.listen(PORT, () => {
-  console.log('Embedded Subtitle Extractor v19 running on port', PORT);
+  console.log('Embedded Subtitle Extractor v21 running on port', PORT);
 });

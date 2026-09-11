@@ -1,6 +1,8 @@
 // MKV extraction using the actively maintained Range-based extractor.
 // It returns ALL text subtitle tracks; language filtering happens only when
 // selecting the output track, never during discovery.
+const { parseSubtitleBytes } = require('./subtitle-parse.js');
+
 let extractorPromise;
 
 async function getExtractor() {
@@ -28,14 +30,23 @@ async function extractMkvTracks(url, safeFetch, cacheKey) {
     verbose: false,
   });
 
-  return (tracks || []).map((t, i) => ({
-    index: i,
-    type: String(t.type || '').toLowerCase(),
-    language: t.metadata?.language,
-    name: t.metadata?.trackName,
-    trackNumber: t.metadata?.trackNumber,
-    bytes: Buffer.from(t.output?.subtitle || []),
-  })).filter(t => t.bytes.length);
+  return (tracks || []).map((t, i) => {
+    const type = String(t.type || '').toLowerCase();
+    const bytes = Buffer.from(t.output?.subtitle || []);
+    // CRITICAL: the rest of the pipeline (chooseTrack/buildSrt) works on
+    // `cues`, not raw bytes. Without this conversion the MKV path silently
+    // yielded zero usable tracks no matter how well extraction worked.
+    const cues = parseSubtitleBytes(bytes, type);
+    return {
+      index: i,
+      type,
+      language: t.metadata?.language,
+      name: t.metadata?.trackName,
+      trackNumber: t.metadata?.trackNumber,
+      bytes,
+      cues,
+    };
+  }).filter(t => t.bytes.length);
 }
 
 module.exports = { extractMkvTracks };
