@@ -5,7 +5,9 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const { extractMp4Tracks } = require('./mp4-subtitles.js');
-const { extractMkvTracks } = require('./mkv-range.js');
+const { extractMkvTracks, extractMkvTracksFromFile } = require('./mkv-range.js');
+const { resolveFinalUrl } = require('./resolve-url.js');
+const { withDownloadedFile } = require('./full-download.js');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -265,7 +267,7 @@ cleanupCacheOnce();
 app.get('/:config/manifest.json', (req, res) => {
   res.json({
     id: 'com.khalid.embeddedass',
-    version: '21.0.0',
+    version: '22.0.0',
     name: 'Embedded ASS Extractor',
     description: 'Extracts embedded text subtitle tracks from remote MKV/MP4 streams and serves a web-compatible SRT.',
     resources: ['subtitles'],
@@ -912,6 +914,15 @@ function chooseTrack(tracks, requestedLang) {
     usable[0];
 }
 
+// Maps a Content-Type from the resolved CDN response to a container guess.
+// Used only to influence extractor ordering, never to skip a candidate.
+function classifyContainerFromContentType(contentType) {
+  const ct = String(contentType || '').toLowerCase();
+  if (/matroska|x-mkv/.test(ct)) return 'mkv';
+  if (/mp4|quicktime/.test(ct)) return 'mp4';
+  return 'unknown';
+}
+
 // Reads the container from a stream's filename/title metadata. AIOStreams
 // exposes the real release filename, which is far more reliable for
 // container identity than probing a CDN/debrid URL's first bytes.
@@ -988,28 +999,39 @@ async function processRequest(streams, cacheKey) {
       // said .mkv. Now we try the real extractors regardless, in the
       // order the available evidence suggests.
       const filenameHint = guessContainerFromFilename(s);
-      let peekInfo = null;
+
+      // STEP 1: Resolve the Torrentio/RD redirect chain ONCE to the final
+      // CDN URL, and find out whether Range actually works there. Every
+      // extractor then talks straight to the CDN instead of re-hitting the
+      // resolver endpoint (which is what produced 403s and bogus
+      // "Range unsupported" readings).
+      let resolved = null;
       try {
-        const { headers, firstBytes } = await peekStream(videoUrl, cacheKey);
-        peekInfo = { headers, firstBytes, container: classifyContainer(headers.contentType, firstBytes) };
-        logPeekDiagnostics(cacheKey, label, s, videoUrl, peekInfo);
-      } catch (probeErr) {
-        log(cacheKey, `Probe of "${label}" failed (${probeErr.message}) — continuing anyway, probe is not a gate.`);
+        resolved = await resolveFinalUrl(videoUrl, safeFetch, cacheKey, log);
+      } catch (resolveErr) {
+        log(cacheKey, `Could not resolve "${label}" to a final URL: ${resolveErr.message} — falling back to the original URL.`);
       }
 
-      const order = decideExtractorOrder(filenameHint, peekInfo && peekInfo.container);
-      log(cacheKey, `"${label}" extractor order: ${order.join(' -> ')} (filename hint: ${filenameHint}, probe says: ${peekInfo ? peekInfo.container : 'probe failed'})`);
+      const targetUrl = resolved ? resolved.url : videoUrl;
+      const rangeWorks = resolved ? resolved.rangeWorks : false;
+      const knownSize = resolved ? resolved.totalSize : null;
+
+      log(cacheKey, `"${label}" hint=${filenameHint} rangeWorks=${rangeWorks} size=${knownSize ? (knownSize / 1024 / 1024).toFixed(0) + 'MB' : 'unknown'}`);
+
+      const order = decideExtractorOrder(filenameHint, resolved && classifyContainerFromContentType(resolved.contentType));
+      log(cacheKey, `"${label}" extractor order: ${order.join(' -> ')}`);
 
       let tracks = [];
       const attemptErrors = [];
+
       for (const kind of order) {
         try {
           if (kind === 'mkv') {
-            log(cacheKey, `Trying MKV Range extractor on "${label}"...`);
-            tracks = await extractMkvTracks(videoUrl, safeFetch, cacheKey);
+            log(cacheKey, `Trying MKV Range extractor on resolved URL for "${label}"...`);
+            tracks = await extractMkvTracks(targetUrl, safeFetch, cacheKey);
           } else {
-            log(cacheKey, `Trying MP4 Range extractor on "${label}"...`);
-            tracks = await extractMp4Tracks(safeFetch, videoUrl, cacheKey);
+            log(cacheKey, `Trying MP4 Range extractor on resolved URL for "${label}"...`);
+            tracks = await extractMp4Tracks(safeFetch, targetUrl, cacheKey);
           }
           if (tracks && tracks.length) {
             log(cacheKey, `${kind.toUpperCase()} extractor returned ${tracks.length} track(s) for "${label}".`);
@@ -1017,15 +1039,40 @@ async function processRequest(streams, cacheKey) {
           }
           log(cacheKey, `${kind.toUpperCase()} extractor returned no tracks for "${label}".`);
         } catch (extractErr) {
-          // Log the REAL error from the extractor rather than hiding it
-          // behind a generic "unsupported container" message.
           attemptErrors.push(`${kind}: ${extractErr.message}`);
           log(cacheKey, `${kind.toUpperCase()} extractor failed on "${label}": ${extractErr.message}`);
         }
       }
 
-      if ((!tracks || !tracks.length) && attemptErrors.length === order.length) {
-        log(cacheKey, `All extractors failed on "${label}" (${attemptErrors.join(' | ')}). Trying next source...`);
+      // STEP 2: If every Range-based attempt failed AND the failures look
+      // like Range problems, fall back to streaming the file to disk and
+      // extracting locally. Only reached when Range is genuinely unusable.
+      if ((!tracks || !tracks.length) && attemptErrors.length) {
+        const rangeRelated = attemptErrors.some(e => /range|403|416/i.test(e));
+        if (rangeRelated && filenameHint !== 'mp4') {
+          try {
+            tracks = await withDownloadedFile(
+              targetUrl,
+              safeFetch,
+              cacheKey,
+              log,
+              { knownSize, suffix: '.mkv' },
+              localPath => extractMkvTracksFromFile(localPath, cacheKey)
+            );
+            if (tracks && tracks.length) {
+              log(cacheKey, `Full-download fallback recovered ${tracks.length} track(s) from "${label}".`);
+            }
+          } catch (fallbackErr) {
+            attemptErrors.push(`full-download: ${fallbackErr.message}`);
+            log(cacheKey, `Full-download fallback failed on "${label}": ${fallbackErr.message}`);
+          }
+        } else {
+          log(cacheKey, `Not attempting full-download fallback for "${label}" (failures were not Range-related, or source is MP4).`);
+        }
+      }
+
+      if (!tracks || !tracks.length) {
+        log(cacheKey, `No tracks obtained from "${label}" (${attemptErrors.join(' | ') || 'no errors reported'}). Trying next source...`);
         continue;
       }
 
@@ -1092,5 +1139,5 @@ function buildSrt(cues) {
 
 const PORT = process.env.PORT || 7005;
 app.listen(PORT, () => {
-  console.log('Embedded Subtitle Extractor v21 running on port', PORT);
+  console.log('Embedded Subtitle Extractor v22 running on port', PORT);
 });

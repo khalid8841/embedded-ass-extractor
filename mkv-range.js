@@ -49,4 +49,50 @@ async function extractMkvTracks(url, safeFetch, cacheKey) {
   }).filter(t => t.bytes.length);
 }
 
-module.exports = { extractMkvTracks };
+// Extracts subtitle tracks from a LOCAL file path, used by the
+// full-download fallback when the remote server refuses Range requests.
+// Uses the streaming matroska-subtitles parser over a plain read stream —
+// no Range needed, and the file is read once from disk rather than held in
+// memory.
+async function extractMkvTracksFromFile(localPath, cacheKey) {
+  const fs = require('fs');
+  const { SubtitleParser } = require('matroska-subtitles');
+
+  return new Promise((resolve, reject) => {
+    const parser = new SubtitleParser();
+    const byTrack = new Map();
+    let trackMeta = [];
+
+    parser.once('tracks', tracks => {
+      trackMeta = tracks || [];
+    });
+
+    parser.on('subtitle', (subtitle, trackNumber) => {
+      if (!byTrack.has(trackNumber)) byTrack.set(trackNumber, []);
+      byTrack.get(trackNumber).push(subtitle);
+    });
+
+    parser.on('error', reject);
+    parser.on('finish', () => {
+      const out = [];
+      for (const meta of trackMeta) {
+        const cues = byTrack.get(meta.number) || [];
+        if (!cues.length) continue;
+        out.push({
+          index: out.length,
+          type: String(meta.type || '').toLowerCase(),
+          language: meta.language,
+          name: meta.name,
+          trackNumber: meta.number,
+          bytes: Buffer.alloc(0),
+          cues: cues.map(c => ({ time: c.time, duration: c.duration, text: c.text })),
+        });
+      }
+      resolve(out);
+    });
+
+    fs.createReadStream(localPath).on('error', reject).pipe(parser);
+  });
+}
+
+module.exports = { extractMkvTracks, extractMkvTracksFromFile };
