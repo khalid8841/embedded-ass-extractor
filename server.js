@@ -1,10 +1,11 @@
 // Embedded ASS/SSA Subtitle Extractor — Stremio/Nuvio-compatible addon
-// v14 — MKV-first candidate ranking + fast MP4 skip; requires streamManifestUrl to end with /manifest.json (fixes AIOStreams 404) (debug-aio), no video access + comprehensive security + correctness pass (see README for the full
+// v17 — universal embedded-text extraction: MKV Range/stream parser + MP4 moov/sample-table Range extractor; requires streamManifestUrl to end with /manifest.json (fixes AIOStreams 404) (debug-aio), no video access + comprehensive security + correctness pass (see README for the full
 // list). This is a single consolidated version, not an incremental patch.
 
 const express = require('express');
 const fetch = require('node-fetch');
-const { SubtitleParser } = require('matroska-subtitles');
+const { extractMp4Tracks } = require('./mp4-subtitles.js');
+const { extractMkvTracks } = require('./mkv-range.js');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -37,7 +38,7 @@ const MAX_CONCURRENT_EXTRACTIONS = 2;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_REQUESTS = 20; // per IP per window, across debug + subtitles endpoints
 const CACHE_TTL_MS = 48 * 60 * 60 * 1000; // 48h — successful results
-const NEGATIVE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min — confirmed "no Arabic track" results
+const NEGATIVE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min — confirmed no embedded text subtitle results
 const MAX_CUES = 50000; // safety ceiling, not a realistic episode's cue count
 const MAX_DOWNLOAD_BYTES = 3 * 1024 * 1024 * 1024; // 3GB safety ceiling while scanning for cues
 
@@ -256,9 +257,9 @@ cleanupCacheOnce();
 app.get('/:config/manifest.json', (req, res) => {
   res.json({
     id: 'com.khalid.embeddedass',
-    version: '14.0.0',
+    version: '17.0.0',
     name: 'Embedded ASS Extractor',
-    description: 'Finds the embedded Arabic ASS/SSA subtitle track and serves it as SRT.',
+    description: 'Extracts embedded text subtitle tracks from remote MKV/MP4 streams and serves a web-compatible SRT.',
     resources: ['subtitles'],
     types: ['movie', 'series'],
     idPrefixes: ['tt'],
@@ -602,7 +603,7 @@ app.get('/subs/:file', (req, res) => {
   fs.createReadStream(filePath).pipe(res);
 });
 
-app.get('/', (req, res) => res.send('Embedded ASS Extractor v14 is running.'));
+app.get('/', (req, res) => res.send('Embedded Subtitle Extractor v17 is running.'));
 
 function waitForFile(filePath, timeoutMs) {
   return new Promise(resolve => {
@@ -661,6 +662,118 @@ async function getCandidates(streamManifestUrl, type, id, cacheKey) {
 // Core extraction pipeline
 // ---------------------------------------------------------------------------
 
+function parseTimecode(s) {
+  const m = String(s).trim().replace(',', '.').match(/^(\d+):(\d{2}):(\d{2})\.(\d{1,3})$/);
+  if (!m) return null;
+  const frac = m[4].padEnd(3, '0');
+  return (((Number(m[1]) * 60 + Number(m[2])) * 60 + Number(m[3])) * 1000) + Number(frac);
+}
+
+function parseSrtBytes(bytes) {
+  const text = Buffer.from(bytes).toString('utf8').replace(/^\uFEFF/, '');
+  const blocks = text.split(/\r?\n\s*\r?\n/);
+  const cues = [];
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/);
+    const ti = lines.findIndex(x => /\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/.test(x));
+    if (ti < 0) continue;
+    const m = lines[ti].match(/(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/);
+    if (!m) continue;
+    const start = parseTimecode(m[1].replace(',', '.'));
+    const end = parseTimecode(m[2].replace(',', '.'));
+    if (start == null || end == null || end <= start) continue;
+    const body = lines.slice(ti + 1).join('\n').trim();
+    if (body) cues.push({ time: start, duration: end - start, text: body });
+  }
+  return cues;
+}
+
+function parseAssBytes(bytes) {
+  const text = Buffer.from(bytes).toString('utf8').replace(/^\uFEFF/, '');
+  const lines = text.split(/\r?\n/);
+  let format = null;
+  const cues = [];
+  for (const line of lines) {
+    if (/^\s*Format\s*:/i.test(line)) {
+      format = line.replace(/^\s*Format\s*:/i, '').split(',').map(x => x.trim().toLowerCase());
+      continue;
+    }
+    if (!/^\s*Dialogue\s*:/i.test(line)) continue;
+    const payload = line.replace(/^\s*Dialogue\s*:/i, '').trim();
+    const parts = [];
+    let rest = payload;
+    const fieldCount = format?.length || 10;
+    for (let i = 0; i < fieldCount - 1; i++) {
+      const idx = rest.indexOf(',');
+      if (idx < 0) break;
+      parts.push(rest.slice(0, idx));
+      rest = rest.slice(idx + 1);
+    }
+    parts.push(rest);
+    const idxStart = format ? format.indexOf('start') : 1;
+    const idxEnd = format ? format.indexOf('end') : 2;
+    const idxText = format ? format.indexOf('text') : parts.length - 1;
+    if (idxStart < 0 || idxEnd < 0 || idxText < 0) continue;
+    const start = parseAssTime(parts[idxStart]);
+    const end = parseAssTime(parts[idxEnd]);
+    const body = parts[idxText] || '';
+    if (start == null || end == null || end <= start || !body) continue;
+    cues.push({ time: start, duration: end - start, text: body });
+  }
+  return cues;
+}
+
+function parseAssTime(s) {
+  const m = String(s || '').trim().match(/^(\d+):(\d{1,2}):(\d{2})[.](\d{1,2})$/);
+  if (!m) return null;
+  return (((Number(m[1]) * 60 + Number(m[2])) * 60 + Number(m[3])) * 1000) + Number(m[4].padEnd(2, '0')) * 10;
+}
+
+function parseVttBytes(bytes) {
+  const text = Buffer.from(bytes).toString('utf8').replace(/^\uFEFF/, '');
+  const blocks = text.split(/\r?\n\s*\r?\n/);
+  const cues = [];
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/);
+    const ti = lines.findIndex(x => /\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*/.test(x));
+    if (ti < 0) continue;
+    const m = lines[ti].match(/(\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}\.\d{3})/);
+    if (!m) continue;
+    const start = parseTimecode(m[1]);
+    const end = parseTimecode(m[2]);
+    const body = lines.slice(ti + 1).join('\n').trim();
+    if (start != null && end != null && end > start && body) cues.push({ time: start, duration: end - start, text: body });
+  }
+  return cues;
+}
+
+function trackBytesToCues(track) {
+  if (!track?.bytes?.length) return [];
+  if (track.type === 'srt' || track.type === 'subrip' || track.type === 'utf8') return parseSrtBytes(track.bytes);
+  if (track.type === 'ass' || track.type === 'ssa') return parseAssBytes(track.bytes);
+  if (track.type === 'vtt' || track.type === 'webvtt') return parseVttBytes(track.bytes);
+  return [];
+}
+
+function isRequestedLanguage(track, requested) {
+  if (!requested) return false;
+  const want = String(requested).toLowerCase();
+  const lang = String(track.language || '').toLowerCase();
+  return lang === want || (want === 'ara' && lang === 'ar') || (want === 'ar' && lang === 'ara');
+}
+
+function trackLabel(t) {
+  return `[#${t.trackNumber ?? t.index ?? '?'}] type=${t.type || '?'} lang=${t.language || '?'} name="${t.name || ''}" cues=${t.cues?.length || 0}`;
+}
+
+function chooseTrack(tracks, requestedLang) {
+  const usable = tracks.filter(t => t && t.cues && t.cues.length);
+  if (!usable.length) return null;
+  return usable.find(t => isRequestedLanguage(t, requestedLang)) ||
+    usable.find(t => /arabic|عرب/i.test(t.name || '')) ||
+    usable[0];
+}
+
 async function processRequest(streams, cacheKey) {
   let probedAtLeastOne = false;
 
@@ -671,144 +784,56 @@ async function processRequest(streams, cacheKey) {
     if (!videoUrl) continue;
 
     log(cacheKey, `--- Checking candidate ${i + 1}/${streams.length}: ${label}`);
-
     try {
-      // Classify the real container from its actual bytes/content-type
-      // before committing to a full parse. We only ever proceed for 'mkv' —
-      // 'mp4' is fast-skipped immediately (MP4 can carry mov_text
-      // subtitles, but never the ASS/SSA tracks we're looking for), and
-      // anything unrecognized is skipped too rather than risking a bad
-      // parse attempt.
       const { headers, firstBytes } = await peekStream(videoUrl, cacheKey);
       const container = classifyContainer(headers.contentType, firstBytes);
+      let tracks = [];
 
       if (container === 'mp4') {
-        log(cacheKey, `"${label}" is MP4 (confirmed via ${/mp4/i.test(headers.contentType || '') ? 'Content-Type' : 'ftyp bytes'}) — MP4 cannot carry ASS/SSA, skipping fast.`);
-        continue;
-      }
-      if (container !== 'mkv') {
-        log(cacheKey, `"${label}" does not look like Matroska (no EBML header) — skipping.`);
+        log(cacheKey, `"${label}" is MP4 — reading embedded text subtitle tracks with HTTP Range.`);
+        tracks = await extractMp4Tracks(safeFetch, videoUrl, cacheKey);
+      } else if (container === 'mkv') {
+        log(cacheKey, `"${label}" is Matroska — reading embedded subtitle tracks with MKV Range extractor.`);
+        tracks = await extractMkvTracks(videoUrl, safeFetch, cacheKey);
+      } else {
+        log(cacheKey, `"${label}" is not a supported text-subtitle container — skipping.`);
         continue;
       }
 
-      const cues = await extractArabicAssCues(videoUrl, cacheKey);
       probedAtLeastOne = true;
-      if (cues && cues.length) {
-        const srt = buildSrt(cues);
-        writeCacheAtomic(cacheKey, srt, {
-          sourceFingerprint: urlFingerprint(videoUrl),
-          sourceLabel: label,
-          extractedAt: Date.now(),
-          notFound: false
-        });
-        log(cacheKey, `Extraction succeeded (${cues.length} cues) from "${label}" (candidate #${i + 1}), cached.`);
-        return;
+      log(cacheKey, `Discovered ${tracks.length} embedded subtitle track(s) in "${label}": ${tracks.map(trackLabel).join(' | ') || '(none)'}`);
+      const selected = chooseTrack(tracks, 'ara');
+      if (!selected) {
+        log(cacheKey, `No usable text subtitle track in "${label}". Trying next source...`);
+        continue;
       }
-      log(cacheKey, `No Arabic ASS/SSA track in "${label}". Trying next source...`);
+
+      log(cacheKey, `Selected embedded track: ${trackLabel(selected)}. Arabic is preferred when present; otherwise first usable track is used for diagnosis.`);
+      const srt = buildSrt(selected.cues);
+      if (!srt.trim()) {
+        log(cacheKey, `Selected track produced empty SRT. Trying next source...`);
+        continue;
+      }
+      writeCacheAtomic(cacheKey, srt, {
+        sourceFingerprint: urlFingerprint(videoUrl),
+        sourceLabel: label,
+        track: { index: selected.index, trackNumber: selected.trackNumber, type: selected.type, language: selected.language, name: selected.name },
+        extractedAt: Date.now(),
+        notFound: false
+      });
+      log(cacheKey, `Embedded subtitle extraction succeeded (${selected.cues.length} cues) from "${label}".`);
+      return;
     } catch (err) {
       log(cacheKey, `Could not read "${label}": ${err.message}`);
     }
   }
 
   if (probedAtLeastOne) {
-    log(cacheKey, 'No Arabic ASS/SSA track found in any readable Matroska candidate — caching as a short-lived negative result.');
-    writeCacheAtomic(cacheKey, '', {
-      sourceFingerprint: null,
-      sourceLabel: null,
-      extractedAt: Date.now(),
-      notFound: true
-    });
+    log(cacheKey, 'No usable embedded text subtitle track found in any readable candidate — caching short-lived negative result.');
+    writeCacheAtomic(cacheKey, '', { sourceFingerprint: null, sourceLabel: null, extractedAt: Date.now(), notFound: true });
   } else {
-    log(cacheKey, 'None of the candidates were readable/valid Matroska sources. Not caching — will retry on next request.');
+    log(cacheKey, 'No readable supported subtitle containers found. Not caching — will retry next request.');
   }
-}
-
-function extractArabicAssCues(videoUrl, cacheKey) {
-  return new Promise(async (resolve, reject) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => {
-      controller.abort();
-      reject(new Error('Extraction timed out'));
-    }, EXTRACT_TIMEOUT_MS);
-
-    let response;
-    try {
-      response = await safeFetch(videoUrl, { signal: controller.signal, headers: UPSTREAM_HEADERS }, cacheKey);
-    } catch (err) {
-      clearTimeout(timer);
-      return reject(err);
-    }
-
-    if (!response.ok || !response.body) {
-      clearTimeout(timer);
-      return reject(new Error(`Bad response (${response.status})`));
-    }
-
-    const parser = new SubtitleParser();
-    let targetTrack = null;
-    const cues = [];
-    let settled = false;
-    let bytesSeen = 0;
-
-    const finish = (result, err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        controller.abort();
-      } catch (_) {}
-      if (err) reject(err);
-      else resolve(result);
-    };
-
-    response.body.on('data', chunk => {
-      bytesSeen += chunk.length;
-      if (bytesSeen > MAX_DOWNLOAD_BYTES) {
-        finish(null, new Error(`Exceeded safety limit of ${MAX_DOWNLOAD_BYTES} bytes while scanning for cues`));
-      }
-    });
-
-    parser.once('tracks', tracks => {
-      log(
-        cacheKey,
-        `Found ${tracks.length} subtitle track(s):`,
-        tracks.map(t => `[#${t.number}] type=${t.type} lang=${t.language || '?'} name="${t.name || ''}"`)
-      );
-
-      const isAssOrSsa = t => t.type === 'ass' || t.type === 'ssa';
-      const isArabicLang = t => (t.language || '').toLowerCase() === 'ara' || (t.language || '').toLowerCase() === 'ar';
-      const isArabicName = t => /arabic|عرب/i.test(t.name || '');
-
-      const candidates = tracks.filter(t => isAssOrSsa(t) && (isArabicLang(t) || isArabicName(t)));
-      const withLangTag = candidates.filter(isArabicLang);
-      targetTrack = (withLangTag.length ? withLangTag : candidates)[0] || null;
-
-      if (!targetTrack) {
-        log(cacheKey, 'No Arabic ASS/SSA track in this file — aborting download early.');
-        finish([]);
-      } else {
-        log(cacheKey, `Selected track #${targetTrack.number}, lang=${targetTrack.language}, name="${targetTrack.name || ''}".`);
-      }
-    });
-
-    parser.on('subtitle', (subtitle, trackNumber) => {
-      if (targetTrack && trackNumber === targetTrack.number) {
-        if (cues.length >= MAX_CUES) {
-          finish(null, new Error(`Exceeded safety limit of ${MAX_CUES} cues`));
-          return;
-        }
-        cues.push(subtitle);
-      }
-    });
-
-    parser.on('error', err => finish(null, err));
-    response.body.on('error', err => finish(null, err));
-
-    response.body.pipe(parser);
-
-    response.body.on('end', () => finish(cues));
-    parser.on('finish', () => finish(cues));
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -838,5 +863,5 @@ function buildSrt(cues) {
 
 const PORT = process.env.PORT || 7005;
 app.listen(PORT, () => {
-  console.log('Embedded ASS Extractor v14 running on port', PORT);
+  console.log('Embedded Subtitle Extractor v17 running on port', PORT);
 });
